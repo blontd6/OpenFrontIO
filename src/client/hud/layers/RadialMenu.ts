@@ -54,6 +54,7 @@ type RequiredRadialMenuConfig = Required<RadialMenuConfig>;
 export class RadialMenu implements Controller {
   private menuElement: d3.Selection<HTMLDivElement, unknown, null, undefined>;
   private tooltipElement: HTMLDivElement | null = null;
+  private touchInfoElement: HTMLDivElement | null = null;
   private isVisible: boolean = false;
 
   private currentLevel: number = 0; // Current menu level (0 = main menu, 1 = submenu, etc.)
@@ -125,6 +126,7 @@ export class RadialMenu implements Controller {
   init() {
     this.createMenuElement();
     this.createTooltipElement();
+    this.createTouchInfoElement();
     this.eventBus.on(CloseViewEvent, (e) => {
       this.hideRadialMenu();
     });
@@ -250,6 +252,106 @@ export class RadialMenu implements Controller {
       ${this.config.tooltipStyle}
     `;
     document.head.appendChild(style);
+  }
+
+  private createTouchInfoElement() {
+    this.touchInfoElement = document.createElement("div");
+    this.touchInfoElement.className = "radial-touch-info";
+    Object.assign(this.touchInfoElement.style, {
+      position: "fixed",
+      bottom: "84px",
+      left: "50%",
+      transform: "translateX(-50%)",
+      background: "rgba(10, 25, 55, 0.97)",
+      border: "1px solid rgba(255,255,255,0.15)",
+      borderTop: "3px solid rgba(255,255,255,0.35)",
+      borderRadius: "12px",
+      padding: "10px 18px",
+      minWidth: "160px",
+      maxWidth: "min(300px, 82vw)",
+      textAlign: "center",
+      color: "white",
+      zIndex: "10001",
+      pointerEvents: "none",
+      fontFamily: "Arial, sans-serif",
+      display: "none",
+      boxShadow: "0 4px 24px rgba(0,0,0,0.65)",
+    });
+    document.body.appendChild(this.touchInfoElement);
+  }
+
+  /**
+   * Shows the touch info panel (mobile alternative to mouse tooltip).
+   * Displays on touchstart so the player can see what they are about to
+   * press before lifting their finger.
+   */
+  private showTouchInfo(
+    items: TooltipItem[] | TooltipKey[],
+    accentColor?: string,
+  ) {
+    if (!this.touchInfoElement) return;
+    this.touchInfoElement.innerHTML = "";
+    this.touchInfoElement.style.borderTop = accentColor
+      ? `3px solid ${accentColor}`
+      : "3px solid rgba(255,255,255,0.35)";
+
+    for (const item of items) {
+      if (!item) continue;
+      const text =
+        "key" in item ? translateText(item.key, item.params) : item.text;
+      if (!text) continue;
+      const div = document.createElement("div");
+      div.textContent = text;
+      switch (item.className) {
+        case "title":
+          Object.assign(div.style, {
+            fontWeight: "bold",
+            fontSize: "15px",
+            marginBottom: "4px",
+          });
+          break;
+        case "description":
+          Object.assign(div.style, {
+            fontSize: "12px",
+            color: "rgba(255,255,255,0.72)",
+            marginBottom: "5px",
+            lineHeight: "1.4",
+          });
+          break;
+        case "cost":
+          Object.assign(div.style, {
+            fontSize: "13px",
+            color: "#f59e0b",
+            fontWeight: "bold",
+          });
+          break;
+        case "count":
+          Object.assign(div.style, { fontSize: "11px", color: "#94a3b8" });
+          break;
+      }
+      this.touchInfoElement.appendChild(div);
+    }
+
+    this.touchInfoElement.style.display = "block";
+  }
+
+  /** Shows the touch info panel with just a name (fallback for items without tooltip data). */
+  private showTouchInfoName(name: string, accentColor?: string) {
+    // Attempt a translation; if not found, clean up the raw key.
+    const translated = translateText(name);
+    const display =
+      translated && translated !== name
+        ? translated
+        : name
+            .replace(/_/g, " ")
+            .replace(/\b\w/g, (c) => c.toUpperCase());
+    this.showTouchInfo([{ text: display, className: "title" }], accentColor);
+  }
+
+  private hideTouchInfo() {
+    if (this.touchInfoElement) {
+      this.touchInfoElement.style.display = "none";
+    }
   }
 
   private getInnerRadiusForLevel(level: number): number {
@@ -449,12 +551,18 @@ export class RadialMenu implements Controller {
     >,
     level: number,
   ) {
-    const onHover = (d: d3.PieArcDatum<MenuElement>, path: any) => {
+    const onHover = (
+      d: d3.PieArcDatum<MenuElement>,
+      path: any,
+      isTouch = false,
+    ) => {
       const disabled = this.params === null || d.data.disabled(this.params);
-      if (d.data.tooltipItems && d.data.tooltipItems.length > 0) {
-        this.showTooltip(d.data.tooltipItems);
-      } else if (d.data.tooltipKeys && d.data.tooltipKeys.length > 0) {
-        this.showTooltip(d.data.tooltipKeys);
+      if (!isTouch) {
+        if (d.data.tooltipItems && d.data.tooltipItems.length > 0) {
+          this.showTooltip(d.data.tooltipItems);
+        } else if (d.data.tooltipKeys && d.data.tooltipKeys.length > 0) {
+          this.showTooltip(d.data.tooltipKeys);
+        }
       }
       if (
         disabled ||
@@ -543,6 +651,9 @@ export class RadialMenu implements Controller {
     arcs.each((d) => {
       const pathId = d.data.id;
       const path = d3.select(`path[data-id="${pathId}"]`);
+      // Tracks whether the finger is still over this arc.  Set true on
+      // touchstart, checked on touchend to implement slide-to-cancel.
+      let touchOnArc = false;
 
       path.on("mouseover", function () {
         onHover(d, path);
@@ -560,10 +671,71 @@ export class RadialMenu implements Controller {
         onClick(d, event);
       });
 
-      path.on("touchstart", function (event) {
+      // On touch devices, show the info panel on press and fire the action
+      // only when the finger lifts (touchend).  This gives mobile players the
+      // same cost/description context that desktop players see via mouse-hover
+      // tooltips, without requiring a separate interaction.
+      path.on("touchstart", (event: Event) => {
         event.preventDefault();
         event.stopPropagation();
-        onClick(d, event);
+        touchOnArc = true;
+        const itemColor = resolveColor(d.data, this.params) ?? undefined;
+        if (d.data.tooltipItems && d.data.tooltipItems.length > 0) {
+          this.showTouchInfo(d.data.tooltipItems, itemColor);
+        } else if (d.data.tooltipKeys && d.data.tooltipKeys.length > 0) {
+          this.showTouchInfo(d.data.tooltipKeys, itemColor);
+        } else {
+          this.showTouchInfoName(d.data.name, itemColor);
+        }
+        onHover(d, path, true);
+      });
+
+      // Slide-to-cancel: if the finger drifts off this arc, un-highlight it
+      // and clear the info panel so the player knows the action won't fire.
+      path.on("touchmove", (event: Event) => {
+        event.preventDefault();
+        const touch = (event as globalThis.TouchEvent).changedTouches?.[0];
+        if (!touch) return;
+        const el = document.elementFromPoint(touch.clientX, touch.clientY);
+        const pathNode = path.node();
+        const stillOnArc =
+          el === pathNode ||
+          ((pathNode as Element | null)?.contains(el) ?? false);
+        if (stillOnArc === touchOnArc) return; // no change
+        touchOnArc = stillOnArc;
+        if (stillOnArc) {
+          // Finger came back — re-highlight and show info again
+          const itemColor = resolveColor(d.data, this.params) ?? undefined;
+          if (d.data.tooltipItems && d.data.tooltipItems.length > 0) {
+            this.showTouchInfo(d.data.tooltipItems, itemColor);
+          } else if (d.data.tooltipKeys && d.data.tooltipKeys.length > 0) {
+            this.showTouchInfo(d.data.tooltipKeys, itemColor);
+          } else {
+            this.showTouchInfoName(d.data.name, itemColor);
+          }
+          onHover(d, path, true);
+        } else {
+          // Finger slid off — clear highlight and info panel (action cancelled)
+          this.hideTouchInfo();
+          onMouseOut(d, path);
+        }
+      });
+
+      path.on("touchend", (event: Event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.hideTouchInfo();
+        onMouseOut(d, path);
+        if (touchOnArc) {
+          onClick(d, event);
+        }
+        touchOnArc = false;
+      });
+
+      path.on("touchcancel", () => {
+        this.hideTouchInfo();
+        onMouseOut(d, path);
+        touchOnArc = false;
       });
     });
   }
@@ -901,6 +1073,7 @@ export class RadialMenu implements Controller {
     this.isVisible = false;
     this.selectedItemId = null;
     this.hideTooltip();
+    this.hideTouchInfo();
 
     this.resetMenu();
     this.isTransitioning = false;
